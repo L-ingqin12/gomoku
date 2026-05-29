@@ -19,6 +19,7 @@ import json
 import os
 import random
 import select
+import sys
 import socket
 import time
 
@@ -438,8 +439,8 @@ class GomokuAI:
         # Hard cap: never exceed max_nodes
         if self.nodes > self.max_nodes:
             return True
-        # Periodic check: every 1024 nodes
-        if self.nodes % 1024 == 0:
+        # Check immediately on first node, then every 512 nodes
+        if self.nodes == 1 or self.nodes % 512 == 0:
             if time.time() > self.deadline:
                 return True
             if self.abort and self.abort():
@@ -959,12 +960,19 @@ def run_pve(stdscr):
 
         if current == ai_color:
             pad.refresh(0, 0, 0, 0, rows - 1, cols - 1)
-            # AI move (15s time limit, Q to abort)
+            # AI move (15s time limit, Q to abort via stdin polling)
             def pve_abort():
-                stdscr.nodelay(1)
-                k = stdscr.getch()
-                stdscr.nodelay(0)
-                return k in (ord('q'), ord('Q'), 27)
+                r, _, _ = select.select([sys.stdin], [], [], 0)
+                if r:
+                    c = sys.stdin.buffer.read(1)
+                    if c in (b'q', b'Q', b'\x1b'):
+                        return True
+                    # Flush any remaining bytes
+                    while True:
+                        rr, _, _ = select.select([sys.stdin], [], [], 0)
+                        if not rr: break
+                        sys.stdin.buffer.read(1)
+                return False
             move = ai.get_move([row[:] for row in board],
                                abort_fn=pve_abort, time_limit=15)
             if move:
@@ -1093,17 +1101,24 @@ def run_eve(stdscr):
     board = [[EMPTY] * SIZE for _ in range(SIZE)]
     current = BLACK
     score = {BLACK: 0, WHITE: 0}
-    msg = f'AI battle: Black(depth {b_depth}) vs White(depth {w_depth})  [Q] quit'
+    msg = f'PRESS Q TO QUIT | Black(depth {b_depth}) vs White(depth {w_depth})'
     win_cells = None
     cursor = (SIZE // 2, SIZE // 2)
 
-    def make_abort_checker(scr):
-        """Return a callable that checks for quit key without blocking."""
+    def make_abort_checker():
+        """Return a callable that checks for quit key via stdin select (safe during AI)."""
         def check():
-            scr.nodelay(1)
-            k = scr.getch()
-            scr.nodelay(0)
-            return k in (ord('q'), ord('Q'), 27)
+            r, _, _ = select.select([sys.stdin], [], [], 0)
+            if r:
+                c = sys.stdin.buffer.read(1)
+                if c in (b'q', b'Q', b'\x1b'):
+                    return True
+                # Drain any extra bytes
+                while True:
+                    rr, _, _ = select.select([sys.stdin], [], [], 0)
+                    if not rr: break
+                    sys.stdin.buffer.read(1)
+            return False
         return check
 
     while True:
@@ -1124,7 +1139,7 @@ def run_eve(stdscr):
 
         # AI move with abort check + 12s time limit
         move = ai.get_move([row[:] for row in board],
-                           abort_fn=make_abort_checker(stdscr),
+                           abort_fn=make_abort_checker(),
                            time_limit=12)
         if move:
             r, c = move
