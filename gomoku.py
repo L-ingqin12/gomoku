@@ -17,6 +17,7 @@ Menu:
 import curses
 import json
 import os
+import random
 import select
 import socket
 import time
@@ -72,24 +73,40 @@ class GomokuAI:
     def __init__(self, color, depth=6):
         self.color = color
         self.opponent = WHITE if color == BLACK else BLACK
-        self.max_depth = max(2, depth)   # ensure at least depth 2
-        self.killer = {}
+        self.max_depth = max(2, depth)
         self.nodes = 0
         self.abort = None
         self.deadline = 0
-        self.max_nodes = 500000          # hard safety cap
+        self.max_nodes = 500000
+        self.temperature = 0.15   # 0 = deterministic, higher = more variety
+        self.opening_moves = 6    # first N moves use more randomness
 
     def get_move(self, board, abort_fn=None, time_limit=0):
-        """Return best move. abort_fn() called periodically; if True, search stops.
-           time_limit: max seconds for search (0 = no limit)."""
         self.nodes = 0
         self.abort = abort_fn
         self.deadline = time.time() + time_limit if time_limit > 0 else float('inf')
 
-        # Fast path: empty board → always play center
+        # Count how many pieces are on the board
         piece_count = sum(1 for r in range(SIZE) for c in range(SIZE) if board[r][c] != EMPTY)
+
+        # Fast path: empty board → random near-center opening
         if piece_count == 0:
-            return (SIZE // 2, SIZE // 2)
+            # Pick randomly from center 3×3 area for variety
+            centers = [(SIZE//2 + dr, SIZE//2 + dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+            return random.choice(centers)
+
+        # Fast path: only 1 piece → play near it, with some randomness
+        if piece_count == 1:
+            candidates = self._candidate_moves(board)
+            if candidates:
+                # Pick randomly from top 5 candidates
+                scored = []
+                for r, c in candidates:
+                    s = self._move_attack(board, r, c, self.color) + self._move_attack(board, r, c, self.opponent) * 1.2
+                    scored.append((s, (r, c)))
+                scored.sort(reverse=True)
+                top = scored[:min(5, len(scored))]
+                return random.choice(top)[1]
 
         candidates = self._candidate_moves(board)
         if not candidates:
@@ -124,7 +141,9 @@ class GomokuAI:
         # 4) Iterative deepening search
         best_move = candidates[0]
         best_score = -float('inf')
-        self.killer.clear()
+        move_scores = {}   # track scores for all moves for randomized selection
+
+        in_opening = piece_count < self.opening_moves
 
         for d in range(2, self.max_depth + 1, 2):
             if self._should_abort():
@@ -144,14 +163,38 @@ class GomokuAI:
                     return (r, c)
                 score = self._minimax(board, d - 1, alpha, beta, False)
                 board[r][c] = EMPTY
+                # Add small noise to break ties and add variety
+                score += random.uniform(-50, 50)
+                move_scores[(r, c)] = score
                 if score > best_score:
                     best_score = score
                     best_move = (r, c)
                 alpha = max(alpha, score)
 
-            # If we found a winning line, stop searching deeper
             if best_score >= WIN_SCORE // 2:
                 break
+
+        # Randomized selection: in opening, pick from top N; always add noise
+        if move_scores:
+            scored = sorted(move_scores.items(), key=lambda x: x[1], reverse=True)
+            if in_opening:
+                # Opening: pick randomly from top 5 with weighted probability
+                top_n = min(5, len(scored))
+                top = scored[:top_n]
+                # Softmax-like: higher scores get higher probability
+                if top[0][1] > 0:
+                    total = sum(s for _, s in top)
+                    weights = [s / total for _, s in top]
+                else:
+                    weights = None
+                best_move = random.choices([m for m, _ in top], weights=weights, k=1)[0]
+            else:
+                # Mid/late game: pick from top 3 if scores are close (noise already applied)
+                if len(scored) >= 2 and abs(scored[0][1] - scored[1][1]) < 200:
+                    top_n = min(3, len(scored))
+                    best_move = random.choice(scored[:top_n])[0]
+                else:
+                    best_move = scored[0][0]
 
         return best_move
 
@@ -357,7 +400,7 @@ class GomokuAI:
         return False
 
     def _evaluate(self, board):
-        """Full-board evaluation scanning all positions."""
+        """Full-board evaluation with tiny noise for variety."""
         my_score = 0
         opp_score = 0
         has = False
@@ -371,16 +414,16 @@ class GomokuAI:
                     opp_score += self._position_score(board, r, c, self.opponent)
         if not has:
             return 0
-        # Bonus for center control in early game
         total_pieces = sum(1 for r in range(SIZE) for c in range(SIZE) if board[r][c] != EMPTY)
         if total_pieces < 6:
-            # Small center bonus
             for r, c in [(SIZE//2, SIZE//2)]:
                 if board[r][c] == self.color:
                     my_score += 50
                 elif board[r][c] == self.opponent:
                     opp_score += 50
-        return my_score - opp_score * 1.15
+        # Tiny noise to break exact ties (1 part in 10,000)
+        noise = random.randint(-50, 50)
+        return my_score - opp_score * 1.15 + noise
 
     def _position_score(self, board, r, c, player):
         """Score all lines passing through (r,c) for the given player."""
