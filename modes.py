@@ -11,6 +11,7 @@ from .constants import PIECE_CH, HLINE, CELL_W, LABEL_W
 from .game import find_win, is_full, new_board, screen_to_board, screen_to_button
 from .ai import GomokuAI
 from .kifu import Kifu
+from .timectrl import TimeController
 from .ui import draw, win_flash, endgame_loop, show_message
 
 
@@ -212,17 +213,23 @@ def run_pve(stdscr):
     kifu = Kifu('pve', f'Human({color_name}) vs AI({diff_name}, depth {depth})')
     ai_result = [None]
     ai_thread = [None]
+    # Dynamic time control: 180s total budget for AI
+    aiclock = TimeController(total_budget=180, min_per_move=3, max_per_move=30)
 
-    def ai_worker(b):
+    def ai_worker(b, limit):
         try:
-            ai_result[0] = ai.get_move(b, time_limit=15)
+            ai_result[0] = ai.get_move(b, time_limit=limit)
         except Exception:
             ai_result[0] = None
 
     while True:
         rows, cols = stdscr.getmaxyx()
         pad = curses.newpad(rows + 40, max(cols, 32))
-        status = 'Your turn' if current == human_color else 'AI thinking...'
+        piece_count = sum(1 for r in range(SIZE) for c in range(SIZE) if board[r][c] != EMPTY)
+        time_limit = aiclock.allocate(piece_count) if current == ai_color else 0
+        status = 'Your turn' if current == human_color else (
+            f'AI thinking... ({aiclock.remaining:.0f}s left, limit {time_limit:.0f}s)'
+        )
         bt, br = draw(pad, board, cursor, current, msg, cols,
                       win_cells=win_cells, score=score, status=status)
         msg = ''
@@ -231,8 +238,9 @@ def run_pve(stdscr):
         if current == ai_color:
             pad.refresh(0, 0, 0, 0, rows - 1, cols - 1)
             ai_result[0] = None
+            t0 = time.time()
             ai_thread[0] = threading.Thread(
-                target=ai_worker, args=([row[:] for row in board],), daemon=True
+                target=ai_worker, args=([row[:] for row in board], time_limit), daemon=True
             )
             ai_thread[0].start()
 
@@ -249,6 +257,8 @@ def run_pve(stdscr):
                 ai_thread[0].join(timeout=0.1)
 
             move = ai_result[0]
+            elapsed = time.time() - t0
+            aiclock.record(elapsed)
             if move:
                 r, c = move
                 if board[r][c] == EMPTY:
