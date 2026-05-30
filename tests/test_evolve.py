@@ -159,5 +159,88 @@ class TestTournament(unittest.TestCase):
         self.assertIn(best, result['scores'])
 
 
+class TestCoevolution(unittest.TestCase):
+    """Tests for co-evolution: blend_weights, CoevolutionPool."""
+
+    def test_blend_weights_ratio_zero(self):
+        from gomoku.evolve import blend_weights, DEFAULT_WEIGHTS
+        result = blend_weights(DEFAULT_WEIGHTS, DEFAULT_WEIGHTS, ratio=0.0)
+        for k in DEFAULT_WEIGHTS:
+            self.assertEqual(result[k], DEFAULT_WEIGHTS[k])
+
+    def test_blend_weights_ratio_half(self):
+        from gomoku.evolve import blend_weights
+        a = {'x': 10.0, 'y': 20.0}
+        b = {'x': 20.0, 'y': 10.0}
+        result = blend_weights(a, b, ratio=0.5)
+        self.assertAlmostEqual(result['x'], 15.0)
+        self.assertAlmostEqual(result['y'], 15.0)
+
+    def test_blend_weights_ratio_learn(self):
+        """Loser learns 25% from winner."""
+        from gomoku.evolve import blend_weights
+        loser = {'defense_mult': 1.0}
+        winner = {'defense_mult': 2.0}
+        result = blend_weights(loser, winner, ratio=0.25)
+        self.assertAlmostEqual(result['defense_mult'], 1.25)
+
+    def test_pool_initialization(self):
+        from gomoku.evolve import CoevolutionPool
+        pool = CoevolutionPool(population_size=4)
+        self.assertGreaterEqual(len(pool.population), 2)
+        self.assertEqual(pool.generation, 0)
+        for name in pool.population:
+            self.assertIn(name, pool.elo)
+            self.assertEqual(pool.elo[name], 1000)
+
+    def test_pool_get_pair(self):
+        from gomoku.evolve import CoevolutionPool
+        pool = CoevolutionPool(population_size=4)
+        a_name, a_w, b_name, b_w = pool.get_pair()
+        self.assertNotEqual(a_name, b_name)
+        self.assertIsInstance(a_w, dict)
+        self.assertIsInstance(b_w, dict)
+
+    def test_pool_update_black_wins(self):
+        from gomoku.evolve import CoevolutionPool
+        pool = CoevolutionPool(population_size=4)
+        a_name, a_w, b_name, b_w = pool.get_pair()
+        old_b = dict(pool.population[b_name])
+        pool.update(a_name, b_name, 'black')
+        # b (loser) weights should have changed
+        new_b = pool.population[b_name]
+        self.assertNotEqual(old_b, new_b)
+
+    def test_pool_best_returns_name(self):
+        from gomoku.evolve import CoevolutionPool
+        pool = CoevolutionPool(population_size=4)
+        best = pool.best()
+        self.assertIn(best, pool.population)
+
+    def test_pool_generation_increments(self):
+        from gomoku.evolve import CoevolutionPool
+        pool = CoevolutionPool(population_size=4)
+        a, aw, b, bw = pool.get_pair()
+        self.assertEqual(pool.generation, 0)
+        pool.update(a, b, 'black')
+        self.assertEqual(pool.generation, 1)
+
+    def test_pool_save_load(self):
+        import tempfile, os
+        from gomoku.evolve import CoevolutionPool
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+        tmp.close()
+        try:
+            pool = CoevolutionPool(population_size=3, save_path=tmp.name)
+            a, aw, b, bw = pool.get_pair()
+            pool.update(a, b, 'black')
+            pool.save()
+
+            pool2 = CoevolutionPool(population_size=3, save_path=tmp.name)
+            self.assertGreater(pool2.generation, 0)
+        finally:
+            os.unlink(tmp.name)
+
+
 if __name__ == '__main__':
     unittest.main()

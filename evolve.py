@@ -318,3 +318,139 @@ def run_tournament(population, games_per_match=2, depth=2):
         'scores': scores,
         'total_games': total_games,
     }
+
+
+# ═══════════════════════════ Co-evolution ═══════════════════════════
+
+def blend_weights(a, b, ratio=0.3):
+    """Blend weights: a learns from b by 'ratio' proportion.
+    ratio=0.3 means 70% a + 30% b."""
+    blended = {}
+    for k in a:
+        blended[k] = round(a[k] * (1 - ratio) + b[k] * ratio, 4)
+    return blended
+
+
+class CoevolutionPool:
+    """Manages an evolving population of AI weight configurations.
+
+    After each EvE game:
+      - Loser's weights move toward winner's (learn from success)
+      - Winner gets tiny mutation (exploration)
+      - Both update opening book
+      - Best weights persisted to disk
+
+    Population diversity maintained via periodic mutation injection.
+    """
+
+    def __init__(self, population_size=4, save_path=None):
+        self.pop_size = population_size
+        self.save_path = save_path
+        # Initialize population from saved or defaults
+        if save_path and os.path.exists(save_path):
+            try:
+                with open(save_path) as f:
+                    saved = json.load(f)
+                self.population = saved.get('population', {})
+                self.generation = saved.get('generation', 0)
+                self.elo = saved.get('elo', {})
+            except (json.JSONDecodeError, KeyError):
+                self._init_default()
+        else:
+            self._init_default()
+        self._ensure_population_size()
+
+    def _init_default(self):
+        base = DEFAULT_WEIGHTS.copy()
+        self.population = {
+            'alpha': base,
+            'beta': mutate_weights(base, rate=0.3, scale=0.1),
+            'gamma': mutate_weights(base, rate=0.3, scale=0.1),
+            'delta': mutate_weights(base, rate=0.5, scale=0.15),
+        }
+        self.generation = 0
+        self.elo = {name: 1000 for name in self.population}
+
+    def _ensure_population_size(self):
+        while len(self.population) < self.pop_size:
+            name = f'gen{self.generation}_{len(self.population)}'
+            base = random.choice(list(self.population.values()))
+            self.population[name] = mutate_weights(base, rate=0.5, scale=0.2)
+            self.elo[name] = 1000
+
+    def get_pair(self):
+        """Return two distinct weight sets for an EvE game."""
+        names = list(self.population.keys())
+        a, b = random.sample(names, 2) if len(names) >= 2 else (names[0], names[0])
+        return a, self.population[a], b, self.population[b]
+
+    def update(self, black_name, white_name, winner):
+        """Update population after a game.
+        winner: 'black', 'white', or 'draw'"""
+        b_w = self.population[black_name]
+        w_w = self.population[white_name]
+
+        # Elo update (K=32)
+        ea = 1.0 / (1.0 + 10.0 ** ((self.elo[white_name] - self.elo[black_name]) / 400.0))
+        if winner == 'black':
+            sa, sb = 1.0, 0.0
+        elif winner == 'white':
+            sa, sb = 0.0, 1.0
+        else:
+            sa, sb = 0.5, 0.5
+        self.elo[black_name] = round(self.elo[black_name] + 32 * (sa - ea))
+        self.elo[white_name] = round(self.elo[white_name] + 32 * (sb - (1 - ea)))
+
+        # Loser learns from winner (or both learn in draw)
+        if winner == 'black':
+            # White (loser) learns from Black (winner)
+            self.population[white_name] = blend_weights(w_w, b_w, ratio=0.25)
+            # Winner gets small exploration mutation
+            self.population[black_name] = mutate_weights(b_w, rate=0.05, scale=0.05)
+        elif winner == 'white':
+            self.population[black_name] = blend_weights(b_w, w_w, ratio=0.25)
+            self.population[white_name] = mutate_weights(w_w, rate=0.05, scale=0.05)
+        else:
+            # Draw: both take a small step toward each other
+            self.population[black_name] = blend_weights(b_w, w_w, ratio=0.1)
+            self.population[white_name] = blend_weights(w_w, b_w, ratio=0.1)
+
+        self.generation += 1
+
+        # Every 10 generations, inject a mutant for diversity
+        if self.generation % 10 == 0:
+            name = f'mutant_{self.generation}'
+            # Mutant based on current best
+            best = self.best()
+            self.population[name] = mutate_weights(self.population[best], rate=0.6, scale=0.25)
+            self.elo[name] = 1000
+            # Keep population size bounded
+            if len(self.population) > self.pop_size * 2:
+                # Remove weakest
+                weakest = min(self.elo, key=self.elo.get)
+                if weakest not in (black_name, white_name):  # don't remove active
+                    del self.population[weakest]
+                    del self.elo[weakest]
+
+    def best(self):
+        """Return name of highest-Elo weight set."""
+        return max(self.elo, key=self.elo.get)
+
+    def save(self):
+        """Persist population to disk."""
+        if not self.save_path:
+            return
+        with open(self.save_path, 'w') as f:
+            json.dump({
+                'population': self.population,
+                'generation': self.generation,
+                'elo': self.elo,
+            }, f)
+
+    def stats(self):
+        """Return summary string."""
+        best_name = self.best()
+        return (
+            f'gen {self.generation} | best: {best_name} ({self.elo[best_name]}) | '
+            f'pop: {len(self.population)}'
+        )

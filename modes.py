@@ -437,21 +437,29 @@ def run_pve(stdscr):
 
 def run_eve(stdscr):
     from .ui import show_eve_menu
+    from .evolve import CoevolutionPool, _make_weighted_ai
+    import os as _os
+
     b_depth, w_depth = show_eve_menu(stdscr)
     if not b_depth:
         return
     b_depth = min(b_depth, 6)
     w_depth = min(w_depth, 6)
 
-    black_ai = GomokuAI(BLACK, b_depth)
-    white_ai = GomokuAI(WHITE, w_depth)
+    # Co-evolution pool for inter-AI learning
+    pool_path = _os.path.join(_os.path.dirname(__file__), 'data', 'evo_pool.json')
+    pool = CoevolutionPool(population_size=4, save_path=pool_path)
+    b_name, b_weights, w_name, w_weights = pool.get_pair()
+
+    black_ai = _make_weighted_ai(BLACK, b_weights, b_depth)
+    white_ai = _make_weighted_ai(WHITE, w_weights, w_depth)
     board = new_board()
     current = BLACK
     score = {BLACK: 0, WHITE: 0}
-    msg = f'Q=QUIT | Black(d{b_depth}) vs White(d{w_depth})'
+    msg = f'Q=QUIT | {pool.stats()}'
     win_cells = None
     cursor = (SIZE // 2, SIZE // 2)
-    kifu = Kifu('eve', f'AI battle: Black(d{b_depth}) vs White(d{w_depth})')
+    kifu = Kifu('eve', f'AI co-evolution: {b_name} vs {w_name}')
     ai_result = [None]
     ai_thread = [None]
 
@@ -484,6 +492,7 @@ def run_eve(stdscr):
             if k in (ord('q'), ord('Q'), 27):
                 ai_obj.abort()
                 ai_thread[0].join(timeout=1)
+                pool.save()
                 kifu.result = 'quit'
                 kifu.score = score
                 kifu.save()
@@ -504,6 +513,14 @@ def run_eve(stdscr):
                     kifu.result = f'{winner} wins'
                     kifu.score = score
                     kifu.save()
+
+                    # Co-evolution update: loser learns from winner
+                    if winner == 'Black AI':
+                        pool.update(b_name, w_name, 'black')
+                    else:
+                        pool.update(b_name, w_name, 'white')
+                    pool.save()
+
                     r2, c2 = stdscr.getmaxyx()
                     p2 = curses.newpad(r2 + 40, max(c2, 32))
                     win_flash(p2, board, cursor, current, wc, score, c2, r2)
@@ -514,12 +531,18 @@ def run_eve(stdscr):
                         board = new_board()
                         cursor = (SIZE // 2, SIZE // 2)
                         current = BLACK
-                        msg = 'New game!'
-                        kifu = Kifu('eve', 'AI battle')
+                        # Get fresh pair for next game
+                        b_name, b_weights, w_name, w_weights = pool.get_pair()
+                        black_ai = _make_weighted_ai(BLACK, b_weights, b_depth)
+                        white_ai = _make_weighted_ai(WHITE, w_weights, w_depth)
+                        msg = f'New game! {pool.stats()}'
+                        kifu = Kifu('eve', f'AI co-evolution: {b_name} vs {w_name}')
                         continue
                     else:
+                        pool.save()
                         return
                 elif is_full(board):
+                    pool.update(b_name, w_name, 'draw')
                     msg = 'Draw!'
                     continue
                 else:
