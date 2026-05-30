@@ -3,7 +3,7 @@
 import sys, os, time, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from gomoku.constants import SIZE, BLACK, WHITE
+from gomoku.constants import SIZE, EMPTY, BLACK, WHITE
 from gomoku.constants import WIN_SCORE, FOUR_SCORE, THREE_SCORE, TWO_SCORE
 from gomoku.game import new_board
 from gomoku.ai import GomokuAI, _count_run, _pattern_score
@@ -129,17 +129,32 @@ class TestAIConsistency(unittest.TestCase):
         ai.abort()
         self.assertTrue(ai._abort_flag)
 
-    def test_abort_returns_move(self):
-        """Aborting still returns a valid move."""
-        ai = GomokuAI(BLACK, depth=6)
+    def test_abort_during_search_returns_move(self):
+        """Abort during search should return the best move found so far."""
+        import threading
+        ai = GomokuAI(BLACK, depth=8)
         b = new_board()
-        b[7][7] = WHITE
-        b[7][8] = WHITE
+        # Moderate complexity to ensure search is in progress
+        for i in range(4):
+            b[7][3 + i] = WHITE
+            b[i][i] = BLACK
+        result = [None]
+
+        def search():
+            result[0] = ai.get_move([r[:] for r in b], time_limit=10)
+
+        t = threading.Thread(target=search, daemon=True)
+        t.start()
+        # Abort after a short delay while the search is running
+        t.join(timeout=0.3)
         ai.abort()
-        move = ai.get_move([r[:] for r in b], time_limit=1)
-        self.assertIsNotNone(move)
+        t.join(timeout=2)
+
+        move = result[0]
+        self.assertIsNotNone(move, 'Aborted search should still return a move')
         self.assertTrue(0 <= move[0] < SIZE)
         self.assertTrue(0 <= move[1] < SIZE)
+        self.assertEqual(b[move[0]][move[1]], EMPTY, 'Move should be on empty cell')
 
 
 class TestVCF(unittest.TestCase):

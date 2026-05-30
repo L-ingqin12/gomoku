@@ -241,7 +241,7 @@ def _make_weighted_ai(color, weights, depth):
             my_score += w['center_bonus']
         elif total < 6 and board[SIZE//2][SIZE//2] == ai.opponent:
             opp_score += w['center_bonus']
-        return my_score - opp_score * w['defense_mult'] + random.randint(
+        return my_score - opp_score * w['defense_mult'] + random.uniform(
             -w['noise_range'], w['noise_range']
         )
 

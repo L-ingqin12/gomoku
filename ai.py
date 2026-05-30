@@ -53,16 +53,28 @@ class GomokuAI:
         self.nodes = 0
         self.max_nodes = 500_000
         self._abort_flag = False
+        self._deadline = float('inf')
 
     def abort(self):
         self._abort_flag = True
 
+    def _timed_out(self):
+        """Check if time limit or node limit exceeded."""
+        if self._abort_flag:
+            return True
+        if self.nodes > self.max_nodes:
+            return True
+        if time.time() > self._deadline:
+            return True
+        return False
+
     # ── main entry ──────────────────────────────────────────────────────
 
-    def get_move(self, board, time_limit=0):
+    def get_move(self, board, time_limit=15):
+        """Return best move. time_limit: max seconds (default 15s)."""
         self.nodes = 0
         self._abort_flag = False
-        deadline = time.time() + time_limit if time_limit > 0 else float('inf')
+        self._deadline = time.time() + max(time_limit, 1)  # minimum 1s
 
         piece_count = sum(
             1 for r in range(SIZE) for c in range(SIZE) if board[r][c] != EMPTY
@@ -104,12 +116,26 @@ class GomokuAI:
         if opp_vcf:
             return opp_vcf
 
-        # Iterative deepening minimax
-        return self._iterative_deepening(board, candidates, deadline, piece_count)
+        # Iterative deepening minimax — guaranteed to return a move
+        move = self._iterative_deepening(board, candidates, piece_count)
+        if move is not None:
+            return move
+        # Foolproof fallback: return first empty candidate
+        for r, c in candidates:
+            if board[r][c] == EMPTY:
+                return (r, c)
+        # Absolute last resort
+        for r in range(SIZE):
+            for c in range(SIZE):
+                if board[r][c] == EMPTY:
+                    return (r, c)
+        return (SIZE // 2, SIZE // 2)
 
     # ── candidate generation ────────────────────────────────────────────
 
     def _candidates(self, board):
+        if self._timed_out():
+            return [(SIZE // 2, SIZE // 2)]
         has_any = any(
             board[r][c] != EMPTY for r in range(SIZE) for c in range(SIZE)
         )
@@ -118,6 +144,8 @@ class GomokuAI:
 
         cells = set()
         for r in range(SIZE):
+            if self._timed_out():
+                break
             for c in range(SIZE):
                 if board[r][c] != EMPTY:
                     for dr in range(-3, 4):
@@ -131,7 +159,9 @@ class GomokuAI:
                                 cells.add((nr, nc))
 
         scored = []
-        for r, c in cells:
+        for i, (r, c) in enumerate(cells):
+            if i % 16 == 0 and self._timed_out():
+                break
             atk = self._cell_score(board, r, c, self.color)
             dfn = self._cell_score(board, r, c, self.opponent)
             scored.append((atk + dfn * 1.25, (r, c)))
@@ -149,9 +179,13 @@ class GomokuAI:
 
     def _find_blocks(self, board, candidates):
         """Find moves that must be blocked (opponent live-4 / rush-4)."""
+        if self._timed_out():
+            return []
         blocks = []
         # Immediate win block
         for r, c in candidates:
+            if self._timed_out():
+                break
             board[r][c] = self.opponent
             if self._is_win(board, r, c, self.opponent):
                 blocks.append((r, c))
@@ -174,6 +208,8 @@ class GomokuAI:
 
     def _vcf_search(self, board, max_depth):
         """Threat-space search for forced win sequences."""
+        if self._timed_out():
+            return None
         threats = self._find_all_threats(board, self.color)
         for start_r, start_c in threats:
             board[start_r][start_c] = self.color
@@ -228,6 +264,8 @@ class GomokuAI:
         """Find all positions where 'player' can create a live-4, rush-4, or live-3."""
         threats = set()
         for r in range(SIZE):
+            if self._timed_out():
+                break
             for c in range(SIZE):
                 if board[r][c] != EMPTY:
                     continue
@@ -240,29 +278,27 @@ class GomokuAI:
 
     # ── minimax search ──────────────────────────────────────────────────
 
-    def _iterative_deepening(self, board, candidates, deadline, piece_count):
+    def _iterative_deepening(self, board, candidates, piece_count):
         best_move = candidates[0]
         best_score = -float('inf')
         move_scores = {}
         in_opening = piece_count < 6
 
         for d in range(2, self.max_depth + 1, 2):
-            if self._abort_flag or time.time() > deadline:
+            if self._timed_out():
                 break
             if best_move in candidates:
                 candidates.remove(best_move)
                 candidates.insert(0, best_move)
 
             for r, c in candidates:
-                if self._abort_flag or time.time() > deadline:
+                if self._timed_out():
                     break
                 board[r][c] = self.color
                 if self._is_win(board, r, c, self.color):
                     board[r][c] = EMPTY
                     return (r, c)
-                score = self._minimax(
-                    board, d - 1, -float('inf'), float('inf'), False, deadline
-                )
+                score = self._minimax(board, d - 1, -float('inf'), float('inf'), False)
                 board[r][c] = EMPTY
                 score += random.uniform(-30, 30)
                 move_scores[(r, c)] = score
@@ -293,8 +329,8 @@ class GomokuAI:
             return random.choice(scored[: min(3, len(scored))])[0]
         return scored[0][0]
 
-    def _minimax(self, board, depth, alpha, beta, maximizing, deadline, _rec=0):
-        if _rec > 20 or self._abort_flag or time.time() > deadline:
+    def _minimax(self, board, depth, alpha, beta, maximizing, _rec=0):
+        if _rec > 20 or self._timed_out():
             return self._evaluate(board)
         if depth == 0:
             return self._evaluate(board)
@@ -314,11 +350,13 @@ class GomokuAI:
         if maximizing:
             best = -float('inf')
             for r, c in cands:
+                if self._timed_out():
+                    break
                 board[r][c] = self.color
                 if self._is_win(board, r, c, self.color):
                     board[r][c] = EMPTY
                     return WIN_SCORE + depth
-                s = self._minimax(board, depth - 1, alpha, beta, False, deadline, _rec + 1)
+                s = self._minimax(board, depth - 1, alpha, beta, False, _rec + 1)
                 board[r][c] = EMPTY
                 if s > best:
                     best = s
@@ -329,11 +367,13 @@ class GomokuAI:
         else:
             best = float('inf')
             for r, c in cands:
+                if self._timed_out():
+                    break
                 board[r][c] = self.opponent
                 if self._is_win(board, r, c, self.opponent):
                     board[r][c] = EMPTY
                     return -(WIN_SCORE + depth)
-                s = self._minimax(board, depth - 1, alpha, beta, True, deadline, _rec + 1)
+                s = self._minimax(board, depth - 1, alpha, beta, True, _rec + 1)
                 board[r][c] = EMPTY
                 if s < best:
                     best = s
@@ -371,4 +411,4 @@ class GomokuAI:
                     )
         if not has:
             return 0
-        return my_score - opp_score * 1.15 + random.randint(-40, 40)
+        return my_score - opp_score * 1.15 + random.uniform(-40, 40)
