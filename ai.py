@@ -49,12 +49,15 @@ class GomokuAI:
     def __init__(self, color, depth=6):
         self.color = color
         self.opponent = WHITE if color == BLACK else BLACK
-        self.max_depth = max(2, depth)
+        self.max_depth = max(2, min(depth, 6))  # cap at 6 for performance
         self.nodes = 0
         self.max_nodes = 500_000
         self._abort_flag = False
         self._deadline = float('inf')
-        self._last_opp_move = None  # (r,c) of opponent's most recent move
+        self._last_opp_move = None
+        self._tt = {}
+        self._defense_mult = 1.15
+        self._candidate_df_mult = 1.25
 
     def abort(self):
         self._abort_flag = True
@@ -84,6 +87,9 @@ class GomokuAI:
         # Find opponent's last move for localized defense
         self._find_last_opponent_move(board)
 
+        # Assess position: aggressive when winning, defensive when threatened
+        self._assess_position(board)
+
         # Opening: random near-center
         if piece_count == 0:
             centers = [
@@ -109,17 +115,11 @@ class GomokuAI:
         if len(blocks) == 1:
             return blocks[0]
 
-        # VCF search — only if enough time remaining (> 3s to deadline)
-        if time_limit <= 0 or self._deadline - time.time() > 3:
-            vcf = self._vcf_search(board, 4)
-            if vcf:
-                return vcf
-
-            # Block opponent VCF
-            opp = GomokuAI(self.opponent, 2)
-            opp_vcf = opp._vcf_search(board, 3)
-            if opp_vcf:
-                return opp_vcf
+        # VCF disabled — time is better spent on deeper minimax
+        # (uncomment below to re-enable for critical situations only)
+        # if time.time() + 2 < self._deadline:
+        #     vcf = self._vcf_search(board, 4)
+        #     if vcf: return vcf
 
         # Iterative deepening minimax — guaranteed to return a move
         move = self._iterative_deepening(board, candidates, piece_count)
@@ -135,6 +135,56 @@ class GomokuAI:
                 if board[r][c] == EMPTY:
                     return (r, c)
         return (SIZE // 2, SIZE // 2)
+
+    def _assess_position(self, board):
+        """Assess board: set dynamic defense_mult based on threat balance.
+        - AI has strong threats → aggressive (lower defense, higher attack)
+        - Opponent has threats → defensive (higher defense)
+        - Neutral → balanced"""
+        my_best = 0
+        opp_best = 0
+        # Quick scan: sample cells near pieces to find best threats
+        sampled = set()
+        for r in range(SIZE):
+            for c in range(SIZE):
+                if board[r][c] != EMPTY:
+                    for dr in range(-2, 3):
+                        for dc in range(-2, 3):
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < SIZE and 0 <= nc < SIZE and (nr, nc) not in sampled:
+                                sampled.add((nr, nc))
+                                if board[nr][nc] == EMPTY:
+                                    # Check what threat this would create for each player
+                                    for dr2, dc2 in DIRS:
+                                        cnt, oe = _count_run(board, nr, nc, dr2, dc2, self.color)
+                                        s = _pattern_score(cnt, oe)
+                                        if s > my_best:
+                                            my_best = s
+                                        cnt, oe = _count_run(board, nr, nc, dr2, dc2, self.opponent)
+                                        s = _pattern_score(cnt, oe)
+                                        if s > opp_best:
+                                            opp_best = s
+        # Dynamic defense_mult
+        if my_best >= THREE_SCORE and my_best > opp_best * 2:
+            # AI has dominant threat → go aggressive
+            self._defense_mult = 0.8
+            self._candidate_df_mult = 0.9
+        elif opp_best >= THREE_SCORE and opp_best > my_best * 2:
+            # Opponent has strong threat → go defensive
+            self._defense_mult = 1.5
+            self._candidate_df_mult = 1.8
+        elif my_best >= THREE_SCORE:
+            # AI has threat but opponent close → slightly aggressive
+            self._defense_mult = 1.0
+            self._candidate_df_mult = 1.1
+        elif opp_best >= THREE_SCORE:
+            # Opponent threat → slightly defensive
+            self._defense_mult = 1.3
+            self._candidate_df_mult = 1.5
+        else:
+            # Neutral → balanced
+            self._defense_mult = 1.15
+            self._candidate_df_mult = 1.25
 
     def _find_last_opponent_move(self, board):
         """Find opponent's most recent move by checking board against last known state.
@@ -195,7 +245,7 @@ class GomokuAI:
                 break
             atk = self._cell_score(board, r, c, self.color)
             dfn = self._cell_score(board, r, c, self.opponent)
-            s = atk + dfn * 1.25
+            s = atk + dfn * self._candidate_df_mult
             # Proximity bonus: cells near opponent's last move get priority
             if self._last_opp_move:
                 lr, lc = self._last_opp_move
@@ -206,7 +256,7 @@ class GomokuAI:
                     s += 100  # moderate bonus for nearby area
             scored.append((s, (r, c)))
         scored.sort(reverse=True)
-        return [pos for _, pos in scored[: min(45, len(scored))]]
+        return [pos for _, pos in scored[: min(25, len(scored))]]
 
     def _cell_score(self, board, r, c, player):
         total = 0
@@ -337,19 +387,29 @@ class GomokuAI:
         return False
 
     def _find_all_threats(self, board, player):
-        """Find all positions where 'player' can create a live-4, rush-4, or live-3."""
+        """Find positions where 'player' can create live-4/rush-4/live-3.
+        Only scans cells near existing pieces for speed."""
         threats = set()
+        # Collect cells near any piece (radius 2)
+        near = set()
         for r in range(SIZE):
             if self._timed_out():
                 break
             for c in range(SIZE):
                 if board[r][c] != EMPTY:
-                    continue
-                for dr, dc in DIRS:
-                    cnt, oe = _count_run(board, r, c, dr, dc, player)
-                    if (cnt == 4 and oe >= 1) or (cnt == 3 and oe == 2):
-                        threats.add((r, c))
-                        break
+                    for dr in range(-2, 3):
+                        for dc in range(-2, 3):
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < SIZE and 0 <= nc < SIZE and board[nr][nc] == EMPTY:
+                                near.add((nr, nc))
+        for r, c in near:
+            if self._timed_out():
+                break
+            for dr, dc in DIRS:
+                cnt, oe = _count_run(board, r, c, dr, dc, player)
+                if (cnt == 4 and oe >= 1) or (cnt == 3 and oe == 2):
+                    threats.add((r, c))
+                    break
         return list(threats)
 
     # ── minimax search ──────────────────────────────────────────────────
@@ -405,11 +465,33 @@ class GomokuAI:
             return random.choice(scored[: min(3, len(scored))])[0]
         return scored[0][0]
 
+    def _board_hash(self, board):
+        """Fast hash of board state for transposition table."""
+        # Only hash occupied cells — much faster than full board
+        pieces = []
+        for r in range(SIZE):
+            for c in range(SIZE):
+                if board[r][c] != EMPTY:
+                    pieces.append((r, c, board[r][c]))
+        return tuple(pieces)
+
     def _minimax(self, board, depth, alpha, beta, maximizing, _rec=0):
         if _rec > 20 or self._timed_out():
             return self._evaluate(board)
         if depth == 0:
             return self._evaluate(board)
+
+        # Transposition table lookup
+        bh = (self._board_hash(board), depth, maximizing)
+        if bh in self._tt:
+            tt_depth, tt_score, tt_bound = self._tt[bh]
+            if tt_depth >= depth:
+                if tt_bound == 'exact':
+                    return tt_score
+                if tt_bound == 'lower' and tt_score >= beta:
+                    return tt_score
+                if tt_bound == 'upper' and tt_score <= alpha:
+                    return tt_score
 
         cands = self._candidates(board)
         if not cands:
@@ -417,45 +499,65 @@ class GomokuAI:
 
         n = len(cands)
         if depth <= 2:
-            cands = cands[: min(n, 18)]
-        elif depth <= 4:
             cands = cands[: min(n, 12)]
-        else:
+        elif depth <= 4:
             cands = cands[: min(n, 8)]
+        else:
+            cands = cands[: min(n, 5)]
 
         if maximizing:
             best = -float('inf')
-            for r, c in cands:
+            first = True
+            for (r, c) in cands:
                 if self._timed_out():
                     break
                 board[r][c] = self.color
                 if self._is_win(board, r, c, self.color):
                     board[r][c] = EMPTY
                     return WIN_SCORE + depth
-                s = self._minimax(board, depth - 1, alpha, beta, False, _rec + 1)
+                # Principal Variation Search
+                if first:
+                    s = self._minimax(board, depth - 1, alpha, beta, False, _rec + 1)
+                    first = False
+                else:
+                    # Null-window search — cheap check if move is worse
+                    s = self._minimax(board, depth - 1, alpha, alpha + 1, False, _rec + 1)
+                    if alpha < s < beta:
+                        # Re-search with full window — it might be better
+                        s = self._minimax(board, depth - 1, alpha, beta, False, _rec + 1)
                 board[r][c] = EMPTY
                 if s > best:
                     best = s
                 alpha = max(alpha, s)
                 if alpha >= beta:
                     break
+            # Store in TT
+            self._tt[bh] = (depth, best, 'exact' if best > alpha else 'upper')
             return best
         else:
             best = float('inf')
-            for r, c in cands:
+            first = True
+            for (r, c) in cands:
                 if self._timed_out():
                     break
                 board[r][c] = self.opponent
                 if self._is_win(board, r, c, self.opponent):
                     board[r][c] = EMPTY
                     return -(WIN_SCORE + depth)
-                s = self._minimax(board, depth - 1, alpha, beta, True, _rec + 1)
+                if first:
+                    s = self._minimax(board, depth - 1, alpha, beta, True, _rec + 1)
+                    first = False
+                else:
+                    s = self._minimax(board, depth - 1, beta - 1, beta, True, _rec + 1)
+                    if alpha < s < beta:
+                        s = self._minimax(board, depth - 1, alpha, beta, True, _rec + 1)
                 board[r][c] = EMPTY
                 if s < best:
                     best = s
                 beta = min(beta, s)
                 if alpha >= beta:
                     break
+            self._tt[bh] = (depth, best, 'exact' if best < beta else 'lower')
             return best
 
     # ── evaluation ──────────────────────────────────────────────────────
@@ -468,23 +570,29 @@ class GomokuAI:
         return False
 
     def _evaluate(self, board):
+        """Sample-based evaluation: only scores cells near pieces."""
         my_score = 0
         opp_score = 0
-        has = False
+        scored = set()
+        # Only evaluate cells within radius 1 of any piece
         for r in range(SIZE):
             for c in range(SIZE):
-                if board[r][c] == self.color:
-                    has = True
-                    my_score += sum(
-                        _pattern_score(*_count_run(board, r, c, dr, dc, self.color))
-                        for dr, dc in DIRS
-                    )
-                elif board[r][c] == self.opponent:
-                    has = True
-                    opp_score += sum(
-                        _pattern_score(*_count_run(board, r, c, dr, dc, self.opponent))
-                        for dr, dc in DIRS
-                    )
-        if not has:
+                if board[r][c] != EMPTY:
+                    for dr in range(-1, 2):
+                        for dc in range(-1, 2):
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < SIZE and 0 <= nc < SIZE and (nr, nc) not in scored:
+                                scored.add((nr, nc))
+                                if board[nr][nc] == self.color:
+                                    my_score += sum(
+                                        _pattern_score(*_count_run(board, nr, nc, ddr, ddc, self.color))
+                                        for ddr, ddc in DIRS
+                                    )
+                                elif board[nr][nc] == self.opponent:
+                                    opp_score += sum(
+                                        _pattern_score(*_count_run(board, nr, nc, ddr, ddc, self.opponent))
+                                        for ddr, ddc in DIRS
+                                    )
+        if not scored:
             return 0
-        return my_score - opp_score * 1.15 + random.uniform(-40, 40)
+        return my_score - opp_score * self._defense_mult + random.uniform(-40, 40)
