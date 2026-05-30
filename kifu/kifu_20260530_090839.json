@@ -1,0 +1,17 @@
+{
+  "mode": "eve",
+  "info": "AI battle: Black(d6) vs White(d6)",
+  "moves": [
+    [
+      7,
+      6,
+      1,
+      0.0022711753845214844
+    ]
+  ],
+  "result": "quit",
+  "score": {
+    "1": 0,
+    "2": 0
+  }
+}

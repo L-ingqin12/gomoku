@@ -54,6 +54,7 @@ class GomokuAI:
         self.max_nodes = 500_000
         self._abort_flag = False
         self._deadline = float('inf')
+        self._last_opp_move = None  # (r,c) of opponent's most recent move
 
     def abort(self):
         self._abort_flag = True
@@ -80,6 +81,9 @@ class GomokuAI:
             1 for r in range(SIZE) for c in range(SIZE) if board[r][c] != EMPTY
         )
 
+        # Find opponent's last move for localized defense
+        self._find_last_opponent_move(board)
+
         # Opening: random near-center
         if piece_count == 0:
             centers = [
@@ -105,16 +109,17 @@ class GomokuAI:
         if len(blocks) == 1:
             return blocks[0]
 
-        # VCF search
-        vcf = self._vcf_search(board, 4)
-        if vcf:
-            return vcf
+        # VCF search — only if enough time remaining (> 3s to deadline)
+        if time_limit <= 0 or self._deadline - time.time() > 3:
+            vcf = self._vcf_search(board, 4)
+            if vcf:
+                return vcf
 
-        # Block opponent VCF
-        opp = GomokuAI(self.opponent, 2)
-        opp_vcf = opp._vcf_search(board, 3)
-        if opp_vcf:
-            return opp_vcf
+            # Block opponent VCF
+            opp = GomokuAI(self.opponent, 2)
+            opp_vcf = opp._vcf_search(board, 3)
+            if opp_vcf:
+                return opp_vcf
 
         # Iterative deepening minimax — guaranteed to return a move
         move = self._iterative_deepening(board, candidates, piece_count)
@@ -130,6 +135,31 @@ class GomokuAI:
                 if board[r][c] == EMPTY:
                     return (r, c)
         return (SIZE // 2, SIZE // 2)
+
+    def _find_last_opponent_move(self, board):
+        """Find opponent's most recent move by checking board against last known state.
+        Falls back to scanning for any opponent piece if no history."""
+        # Simple heuristic: find an opponent piece with fewest friendly neighbors
+        # (most likely the last move, since opponent just played)
+        best = None
+        best_neighbors = 999
+        for r in range(SIZE):
+            for c in range(SIZE):
+                if board[r][c] == self.opponent:
+                    # Count friendly neighbors (pieces of same color nearby)
+                    neighbors = 0
+                    for dr in (-1, 0, 1):
+                        for dc in (-1, 0, 1):
+                            if dr == 0 and dc == 0:
+                                continue
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < SIZE and 0 <= nc < SIZE and board[nr][nc] == self.opponent:
+                                neighbors += 1
+                    if neighbors < best_neighbors:
+                        best_neighbors = neighbors
+                        best = (r, c)
+        self._last_opp_move = best
+        return best
 
     # ── candidate generation ────────────────────────────────────────────
 
@@ -148,8 +178,9 @@ class GomokuAI:
                 break
             for c in range(SIZE):
                 if board[r][c] != EMPTY:
-                    for dr in range(-3, 4):
-                        for dc in range(-3, 4):
+                    # Radius 2 around each piece (was 3) — tight enough for threats
+                    for dr in range(-2, 3):
+                        for dc in range(-2, 3):
                             nr, nc = r + dr, c + dc
                             if (
                                 0 <= nr < SIZE
@@ -164,9 +195,18 @@ class GomokuAI:
                 break
             atk = self._cell_score(board, r, c, self.color)
             dfn = self._cell_score(board, r, c, self.opponent)
-            scored.append((atk + dfn * 1.25, (r, c)))
+            s = atk + dfn * 1.25
+            # Proximity bonus: cells near opponent's last move get priority
+            if self._last_opp_move:
+                lr, lc = self._last_opp_move
+                dist = abs(r - lr) + abs(c - lc)
+                if dist <= 2:
+                    s += 500  # significant bonus for immediate response area
+                elif dist <= 4:
+                    s += 100  # moderate bonus for nearby area
+            scored.append((s, (r, c)))
         scored.sort(reverse=True)
-        return [pos for _, pos in scored[: min(60, len(scored))]]
+        return [pos for _, pos in scored[: min(45, len(scored))]]
 
     def _cell_score(self, board, r, c, player):
         total = 0
@@ -178,11 +218,12 @@ class GomokuAI:
     # ── blocking ────────────────────────────────────────────────────────
 
     def _find_blocks(self, board, candidates):
-        """Find moves that must be blocked (opponent live-4 / rush-4)."""
+        """Find urgent defensive moves (opponent win / live-4 / rush-4 / double-three).
+        Prioritizes threats near opponent's last move."""
         if self._timed_out():
             return []
         blocks = []
-        # Immediate win block
+        # 1) Immediate five-in-row block — highest priority
         for r, c in candidates:
             if self._timed_out():
                 break
@@ -193,8 +234,16 @@ class GomokuAI:
         if blocks:
             return blocks
 
-        # Live-4 / rush-4 block
-        for r, c in candidates:
+        # 2) Prioritize candidates near opponent's last move
+        ordered = list(candidates)
+        if self._last_opp_move:
+            lr, lc = self._last_opp_move
+            ordered.sort(key=lambda pos: abs(pos[0] - lr) + abs(pos[1] - lc))
+
+        # 3) Live-4 / rush-4 detection (near last move first)
+        for r, c in ordered:
+            if self._timed_out():
+                break
             board[r][c] = self.opponent
             for dr, dc in DIRS:
                 cnt, oe = _count_run(board, r, c, dr, dc, self.opponent)
@@ -202,7 +251,34 @@ class GomokuAI:
                     blocks.append((r, c))
                     break
             board[r][c] = EMPTY
-        return blocks
+            if len(blocks) >= 2:  # multiple live-4 threats — block one
+                break
+        if blocks:
+            return blocks
+
+        # 4) Double live-3 detection (opponent creating dual threat)
+        live3_spots = []
+        for r, c in ordered:
+            if self._timed_out():
+                break
+            board[r][c] = self.opponent
+            l3_count = 0
+            for dr, dc in DIRS:
+                cnt, oe = _count_run(board, r, c, dr, dc, self.opponent)
+                if cnt == 3 and oe == 2:
+                    l3_count += 1
+            if l3_count >= 2:  # creates double live-3 → must block
+                blocks.append((r, c))
+            elif l3_count == 1:
+                live3_spots.append((r, c))
+            board[r][c] = EMPTY
+        if blocks:
+            return blocks
+        # If opponent has multiple live-3 threats, block the one near last move
+        if len(live3_spots) >= 2:
+            return [live3_spots[0]]
+
+        return []
 
     # ── VCF threat search ───────────────────────────────────────────────
 
@@ -341,11 +417,11 @@ class GomokuAI:
 
         n = len(cands)
         if depth <= 2:
-            cands = cands[: min(n, 25)]
-        elif depth <= 4:
             cands = cands[: min(n, 18)]
-        else:
+        elif depth <= 4:
             cands = cands[: min(n, 12)]
+        else:
+            cands = cands[: min(n, 8)]
 
         if maximizing:
             best = -float('inf')
